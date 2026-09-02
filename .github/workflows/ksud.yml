@@ -1,10 +1,12 @@
 name: Build ksud
+
 on:
   workflow_call:
     inputs:
       target:
         required: true
         type: string
+        description: "Rust target triple (e.g., aarch64-linux-android, x86_64-pc-windows-msvc)"
       pack_lkm:
         required: false
         type: boolean
@@ -13,9 +15,18 @@ on:
         required: false
         type: boolean
         default: false
+      # 新增：指定运行平台
+      runner:
+        required: false
+        type: string
+        default: "ubuntu-latest"
+        description: "GitHub runner to use (ubuntu-latest, windows-latest, macos-latest)"
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # 根据输入参数动态选择 runner
+    runs-on: ${{ inputs.runner || (contains(inputs.target, 'windows') && 'windows-latest' || 'ubuntu-latest') }}
+    
     steps:
     - uses: actions/checkout@v7
       with:
@@ -24,45 +35,95 @@ jobs:
     - name: Download artifacts
       uses: actions/download-artifact@v8
     
+    # ============ Windows 专用步骤 ============
+    - name: Setup Windows build environment
+      if: contains(inputs.target, 'windows')
+      run: |
+        echo "Setting up Windows build environment..."
+        # 确保 MSVC 工具链可用
+        rustup default stable-msvc
+        
+    # ============ 准备 LKM 文件 (仅 Linux) ============
     - name: Prepare LKM files
-      if: ${{ inputs.pack_lkm }}
+      if: ${{ inputs.pack_lkm && !contains(inputs.target, 'windows') }}
       run: |
         cp aarch64-android*-lkm/*_kernelsu.ko ./userspace/ksud/bin/aarch64/
         cp x86_64-android*-lkm/*_kernelsu.ko ./userspace/ksud/bin/x86_64/
     
+    # ============ 准备 ksuinit (仅 Linux) ============
     - name: Prepare ksuinit
-      if: ${{ inputs.pack_ksuinit }}
+      if: ${{ inputs.pack_ksuinit && !contains(inputs.target, 'windows') }}
       run: |
         mv ksuinit-aarch64/ksuinit ./userspace/ksud/bin/aarch64/
         mv ksuinit-x86_64/ksuinit ./userspace/ksud/bin/x86_64/
-        
+    
+    # ============ 设置 Rust ============
     - name: Setup rustup
       run: |
         rustup update stable
         rustup target add ${{ inputs.target }}
-
-    - uses: Swatinem/rust-cache@v2
+    
+    # ============ 设置 Windows 编译链 ============
+    - name: Install Windows build tools
+      if: contains(inputs.target, 'windows')
+      run: |
+        # 如果是 GNU 工具链
+        if [[ "${{ inputs.target }}" == *"gnu"* ]]; then
+          # 安装 MinGW
+          rustup toolchain install stable-x86_64-pc-windows-gnu
+          rustup default stable-x86_64-pc-windows-gnu
+        else
+          # MSVC 工具链（需要 Visual Studio Build Tools）
+          # 在 windows-latest runner 上已经预装了
+          echo "Using MSVC toolchain"
+        fi
+    
+    - name: Setup Rust cache
+      uses: Swatinem/rust-cache@v2
       with:
         workspaces: userspace/ksud
         cache-targets: false
 
-    - uses: nttld/setup-ndk@v1
+    # ============ 设置 Android NDK (仅 Android 目标) ============
+    - name: Setup NDK
+      if: contains(inputs.target, 'android')
+      uses: nttld/setup-ndk@v1
       id: setup-ndk
       with:
         ndk-version: r29
 
+    # ============ 构建 ============
     - name: Build ksud
       env:
         ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        # Windows 特定环境变量
+        RUSTFLAGS: ${{ contains(inputs.target, 'windows') && '-C target-feature=+crt-static' || '' }}
       run: |
         if [ "${{ github.event_name }}" = "pull_request" ]; then
           export KSU_PACKAGE_NAME="me.weishu.kernelsu.pr"
         fi
-        source .github/scripts/setup-rust-build.sh ${{ inputs.target }} 26
-        cargo build --target $TRIPLE --release --manifest-path ./userspace/ksud/Cargo.toml
+        
+        # 对于 Windows，直接构建
+        if [[ "${{ inputs.target }}" == *"windows"* ]]; then
+          cargo build --target ${{ inputs.target }} --release --manifest-path ./userspace/ksud/Cargo.toml
+        else
+          # 对于 Android/Linux，使用脚本
+          source .github/scripts/setup-rust-build.sh ${{ inputs.target }} 26
+          cargo build --target $TRIPLE --release --manifest-path ./userspace/ksud/Cargo.toml
+        fi
+        
+        # 检查构建产物
+        if [[ "${{ inputs.target }}" == *"windows"* ]]; then
+          ls -la target/${{ inputs.target }}/release/ksud.exe
+        else
+          ls -la target/${{ inputs.target }}/release/ksud
+        fi
 
+    # ============ 上传产物 ============
     - name: Upload ksud artifact
       uses: actions/upload-artifact@v7
       with:
         name: ksud-${{ inputs.target }}
-        path: target/${{ inputs.target }}/release/ksud
+        path: |
+          target/${{ inputs.target }}/release/ksud
+          target/${{ inputs.target }}/release/ksud.exe
