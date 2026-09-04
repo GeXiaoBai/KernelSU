@@ -1,0 +1,200 @@
+name: Build ksud with all LKM
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Rust target triple'
+        required: true
+        type: choice
+        options:
+          - aarch64-linux-android
+          - x86_64-linux-android
+          - x86_64-unknown-linux-gnu
+          - x86_64-pc-windows-msvc
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+        default: aarch64-linux-android
+      pack_ksuinit:
+        description: 'Pack ksuinit'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  # ============ Job 1: 构建所有 LKM ============
+  build-lkm:
+    name: Build LKM for ${{ matrix.kmi }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang llvm lld libelf-dev
+
+      # 这里替换为实际的 LKM 构建命令
+      - name: Build LKM for ${{ matrix.kmi }}
+        run: |
+          # 请根据实际项目修改构建命令
+          # 假设构建脚本在 kernel_modules/ 目录
+          make KMI=${{ matrix.kmi }} -C kernel_modules/
+          # 或使用项目自带的构建脚本
+          # ./build-lkm.sh --kmi ${{ matrix.kmi }}
+          
+          # 将构建产物移动到统一目录
+          mkdir -p artifacts/${{ matrix.kmi }}
+          find . -name "*.ko" -exec cp {} artifacts/${{ matrix.kmi }}/ \;
+
+      - name: Upload LKM artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lkm-${{ matrix.kmi }}
+          path: artifacts/${{ matrix.kmi }}/*.ko
+          if-no-files-found: warn
+
+  # ============ Job 2: 构建 ksud 并打包所有 LKM ============
+  build-ksud:
+    name: Build ksud with all LKM
+    runs-on: ubuntu-latest
+    needs: build-lkm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download all LKM artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: lkm-*
+          path: ./lkm-artifacts
+          merge-multiple: true
+
+      - name: Organize LKM files
+        run: |
+          # 创建 ksud 的 bin 目录
+          mkdir -p ./userspace/ksud/bin/aarch64/
+          mkdir -p ./userspace/ksud/bin/x86_64/
+          
+          # 根据文件名中的架构分类
+          for lkm in ./lkm-artifacts/*.ko; do
+            if [[ "$lkm" == *"aarch64"* ]] || [[ "$lkm" == *"arm64"* ]]; then
+              cp "$lkm" ./userspace/ksud/bin/aarch64/
+            elif [[ "$lkm" == *"x86_64"* ]] || [[ "$lkm" == *"x64"* ]]; then
+              cp "$lkm" ./userspace/ksud/bin/x86_64/
+            fi
+          done
+          
+          echo "LKM files organized:"
+          ls -la ./userspace/ksud/bin/aarch64/ || true
+          ls -la ./userspace/ksud/bin/x86_64/ || true
+
+      - name: Prepare ksuinit (optional)
+        if: inputs.pack_ksuinit
+        run: |
+          # 假设 ksuinit 已经预先构建好并作为 artifact 存在
+          # 或者从特定目录获取
+          mkdir -p ./userspace/ksud/bin/aarch64/
+          mkdir -p ./userspace/ksud/bin/x86_64/
+          # 如果 ksuinit 在仓库中
+          find . -name "ksuinit" -exec cp {} ./userspace/ksud/bin/ \;
+
+      - name: Setup rustup
+        run: |
+          rustup update stable
+          rustup target add ${{ inputs.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: userspace/ksud
+          cache-targets: false
+          cache-bin: false
+
+      - name: Install cross
+        run: |
+          RUSTFLAGS="" cargo install cross --git https://github.com/cross-rs/cross --rev 66845c1
+
+      - name: Assemble LKM bootstrap
+        run: |
+          clang --target=aarch64-linux-gnu -c -nostdlib \
+            -o userspace/ksud/.lkm_image_bootstrap.o \
+            userspace/ksud/src/lkm_image_bootstrap.S || true
+
+      - name: Build ksud
+        run: |
+          CROSS_NO_WARNINGS=0 cross build --target ${{ inputs.target }} --release \
+            --manifest-path ./userspace/ksud/Cargo.toml
+
+      - name: Upload ksud with LKM
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksud-${{ inputs.target }}-with-lkm
+          path: target/${{ inputs.target }}/release/ksud*
+
+  # ============ Job 3: 可选 - 打包所有内容上传到 Release ============
+  package-release:
+    name: Package and upload to Release
+    runs-on: ubuntu-latest
+    needs: build-ksud
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    steps:
+      - name: Download ksud artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ksud-${{ inputs.target }}-with-lkm
+          path: ./ksud-bin
+
+      - name: Package
+        run: |
+          # 如果是 Android 目标，打包成 zip
+          if [[ "${{ inputs.target }}" == *"android"* ]]; then
+            zip -r ksud-${{ inputs.target }}.zip ./ksud-bin/
+          else
+            tar -czf ksud-${{ inputs.target }}.tar.gz ./ksud-bin/
+          fi
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          draft: true
+          prerelease: false
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./ksud-${{ inputs.target }}.zip
+          asset_name: ksud-${{ inputs.target }}-with-lkm.zip
+          asset_content_type: application/zip
