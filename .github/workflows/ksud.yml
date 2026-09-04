@@ -15,16 +15,47 @@ on:
         required: false
         type: boolean
         default: false
-      # 新增：指定运行平台
       runner:
         required: false
         type: string
         default: "ubuntu-latest"
         description: "GitHub runner to use (ubuntu-latest, windows-latest, macos-latest)"
 
+  # 新增：手动触发，支持选择目标平台
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Rust target triple'
+        required: true
+        type: choice
+        options:
+          - x86_64-unknown-linux-gnu      # Linux 64位
+          - x86_64-pc-windows-msvc        # Windows 64位 (MSVC)
+          - aarch64-linux-android         # Android ARM64
+          - x86_64-linux-android          # Android x86_64
+        default: 'x86_64-unknown-linux-gnu'
+      pack_lkm:
+        description: 'Pack LKM kernel modules (only for Android)'
+        required: false
+        type: boolean
+        default: false
+      pack_ksuinit:
+        description: 'Pack ksuinit (only for Android)'
+        required: false
+        type: boolean
+        default: false
+      runner:
+        description: 'GitHub runner'
+        required: false
+        type: choice
+        options:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+        default: 'ubuntu-latest'
+
 jobs:
   build:
-    # 根据输入参数动态选择 runner
     runs-on: ${{ inputs.runner || (contains(inputs.target, 'windows') && 'windows-latest' || 'ubuntu-latest') }}
     
     steps:
@@ -34,28 +65,28 @@ jobs:
 
     - name: Download artifacts
       uses: actions/download-artifact@v8
-    
+      continue-on-error: true   # 允许没有前置产物继续
+
     # ============ Windows 专用步骤 ============
     - name: Setup Windows build environment
       if: contains(inputs.target, 'windows')
       run: |
         echo "Setting up Windows build environment..."
-        # 确保 MSVC 工具链可用
         rustup default stable-msvc
         
-    # ============ 准备 LKM 文件 (仅 Linux) ============
+    # ============ 准备 LKM 文件 (仅 Linux/Android) ============
     - name: Prepare LKM files
       if: ${{ inputs.pack_lkm && !contains(inputs.target, 'windows') }}
       run: |
-        cp aarch64-android*-lkm/*_kernelsu.ko ./userspace/ksud/bin/aarch64/
-        cp x86_64-android*-lkm/*_kernelsu.ko ./userspace/ksud/bin/x86_64/
+        cp aarch64-android*-lkm/*_kernelsu.ko ./userspace/ksud/bin/aarch64/ || true
+        cp x86_64-android*-lkm/*_kernelsu.ko ./userspace/ksud/bin/x86_64/ || true
     
-    # ============ 准备 ksuinit (仅 Linux) ============
+    # ============ 准备 ksuinit (仅 Linux/Android) ============
     - name: Prepare ksuinit
       if: ${{ inputs.pack_ksuinit && !contains(inputs.target, 'windows') }}
       run: |
-        mv ksuinit-aarch64/ksuinit ./userspace/ksud/bin/aarch64/
-        mv ksuinit-x86_64/ksuinit ./userspace/ksud/bin/x86_64/
+        mv ksuinit-aarch64/ksuinit ./userspace/ksud/bin/aarch64/ || true
+        mv ksuinit-x86_64/ksuinit ./userspace/ksud/bin/x86_64/ || true
     
     # ============ 设置 Rust ============
     - name: Setup rustup
@@ -67,14 +98,10 @@ jobs:
     - name: Install Windows build tools
       if: contains(inputs.target, 'windows')
       run: |
-        # 如果是 GNU 工具链
         if [[ "${{ inputs.target }}" == *"gnu"* ]]; then
-          # 安装 MinGW
           rustup toolchain install stable-x86_64-pc-windows-gnu
           rustup default stable-x86_64-pc-windows-gnu
         else
-          # MSVC 工具链（需要 Visual Studio Build Tools）
-          # 在 windows-latest runner 上已经预装了
           echo "Using MSVC toolchain"
         fi
     
@@ -96,23 +123,24 @@ jobs:
     - name: Build ksud
       env:
         ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        # Windows 特定环境变量
         RUSTFLAGS: ${{ contains(inputs.target, 'windows') && '-C target-feature=+crt-static' || '' }}
       run: |
         if [ "${{ github.event_name }}" = "pull_request" ]; then
           export KSU_PACKAGE_NAME="me.weishu.kernelsu.pr"
         fi
         
-        # 对于 Windows，直接构建
+        # 根据目标类型选择构建方式
         if [[ "${{ inputs.target }}" == *"windows"* ]]; then
           cargo build --target ${{ inputs.target }} --release --manifest-path ./userspace/ksud/Cargo.toml
-        else
-          # 对于 Android/Linux，使用脚本
+        elif [[ "${{ inputs.target }}" == *"android"* ]]; then
           source .github/scripts/setup-rust-build.sh ${{ inputs.target }} 26
           cargo build --target $TRIPLE --release --manifest-path ./userspace/ksud/Cargo.toml
+        else
+          # Linux / 其他非 Android 目标，直接构建
+          cargo build --target ${{ inputs.target }} --release --manifest-path ./userspace/ksud/Cargo.toml
         fi
         
-        # 检查构建产物
+        # 检查产物
         if [[ "${{ inputs.target }}" == *"windows"* ]]; then
           ls -la target/${{ inputs.target }}/release/ksud.exe
         else
@@ -127,3 +155,4 @@ jobs:
         path: |
           target/${{ inputs.target }}/release/ksud
           target/${{ inputs.target }}/release/ksud.exe
+        if-no-files-found: warn
