@@ -41,11 +41,13 @@ jobs:
       expected_size2: ${{ inputs.expected_size2 || '' }}
       expected_hash2: ${{ inputs.expected_hash2 || '' }}
 
-  # 新增：打包所有构建产物并上传到 Release
   upload-to-release:
     needs: build-lkm
     runs-on: ubuntu-latest
+    # 只有手动触发且提供了 release_tag 才运行
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != ''
+    permissions:
+      contents: write  # 关键：赋予写入权限
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -54,7 +56,7 @@ jobs:
           
       - name: Package LKM files
         run: |
-          zip -r lkm-modules.zip ./artifacts/*.ko ./artifacts/*.so 2>/dev/null || zip -r lkm-modules.zip ./artifacts/
+          zip -r lkm-modules.zip ./artifacts/ || true
           
       - name: Create Release
         id: create_release
