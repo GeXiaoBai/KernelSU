@@ -1,4 +1,5 @@
 name: Build ksud with cross
+
 on:
   workflow_call:
     inputs:
@@ -17,9 +18,35 @@ on:
         required: false
         type: boolean
         default: false
+  
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Rust target triple'
+        required: true
+        type: choice
+        options:
+          - aarch64-linux-android
+          - x86_64-linux-android
+          - x86_64-unknown-linux-gnu
+          - x86_64-pc-windows-msvc
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+        default: aarch64-linux-android
+      pack_lkm:
+        description: 'Pack all LKM kernel modules'
+        required: false
+        type: boolean
+        default: true
+      pack_ksuinit:
+        description: 'Pack ksuinit'
+        required: false
+        type: boolean
+        default: false
+
 jobs:
   build:
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && 'ubuntu-latest' || inputs.os }}
     steps:
     - uses: actions/checkout@v7
       with:
@@ -27,25 +54,47 @@ jobs:
 
     - name: Download artifacts
       uses: actions/download-artifact@v8
+      continue-on-error: true
     
-    - name: Prepare LKM files
-      if: ${{ inputs.pack_lkm }}
+    # 当 pack_lkm 启用时，复制所有内核版本的 LKM
+    - name: Prepare all LKM files
+      if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pack_lkm == 'true') || inputs.pack_lkm }}
       run: |
-        cp aarch64-android*-lkm/*_kernelsu.ko ./userspace/ksud/bin/aarch64/
-        cp x86_64-android*-lkm/*_kernelsu.ko ./userspace/ksud/bin/x86_64/
+        # 创建目录
+        mkdir -p ./userspace/ksud/bin/aarch64/
+        mkdir -p ./userspace/ksud/bin/x86_64/
+        
+        # 复制所有 ARM64 LKM
+        for lkm_dir in aarch64-android*-lkm; do
+          if [ -d "$lkm_dir" ]; then
+            cp $lkm_dir/*_kernelsu.ko ./userspace/ksud/bin/aarch64/ 2>/dev/null || true
+          fi
+        done
+        
+        # 复制所有 x86_64 LKM
+        for lkm_dir in x86_64-android*-lkm; do
+          if [ -d "$lkm_dir" ]; then
+            cp $lkm_dir/*_kernelsu.ko ./userspace/ksud/bin/x86_64/ 2>/dev/null || true
+          fi
+        done
+        
+        echo "Copied LKM files:"
+        ls -la ./userspace/ksud/bin/aarch64/ || true
+        ls -la ./userspace/ksud/bin/x86_64/ || true
     
     - name: Prepare ksuinit
-      if: ${{ inputs.pack_ksuinit }}
+      if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pack_ksuinit == 'true') || inputs.pack_ksuinit }}
       run: |
-        mv ksuinit-aarch64/ksuinit ./userspace/ksud/bin/aarch64/
-        mv ksuinit-x86_64/ksuinit ./userspace/ksud/bin/x86_64/
+        mkdir -p ./userspace/ksud/bin/aarch64/
+        mkdir -p ./userspace/ksud/bin/x86_64/
+        mv ksuinit-aarch64/ksuinit ./userspace/ksud/bin/aarch64/ 2>/dev/null || true
+        mv ksuinit-x86_64/ksuinit ./userspace/ksud/bin/x86_64/ 2>/dev/null || true
         
     - name: Setup rustup
       run: |
         rustup update stable
-        if [[ ${{ inputs.target }} == *"-apple-darwin" ]]; then
-          rustup target add ${{ inputs.target }}
-        fi
+        rustup target add ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target || inputs.target }}
+    
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: userspace/ksud
@@ -60,13 +109,15 @@ jobs:
       run: |
         clang --target=aarch64-linux-gnu -c -nostdlib \
           -o userspace/ksud/.lkm_image_bootstrap.o \
-          userspace/ksud/src/lkm_image_bootstrap.S
+          userspace/ksud/src/lkm_image_bootstrap.S || true
 
     - name: Build ksud
-      run: CROSS_NO_WARNINGS=0 cross build --target ${{ inputs.target }} --release --manifest-path ./userspace/ksud/Cargo.toml
+      run: |
+        TARGET="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target || inputs.target }}"
+        CROSS_NO_WARNINGS=0 cross build --target $TARGET --release --manifest-path ./userspace/ksud/Cargo.toml
 
     - name: Upload ksud artifact
       uses: actions/upload-artifact@v7
       with:
-        name: ksud-${{ inputs.target }}
-        path: target/${{ inputs.target }}/release/ksud*
+        name: ksud-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target || inputs.target }}
+        path: target/${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target || inputs.target }}/release/ksud*
