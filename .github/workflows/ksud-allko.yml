@@ -22,9 +22,70 @@ on:
         default: false
 
 jobs:
+  # ============ Job 0: 构建 ksuinit ============
+  build-ksuinit:
+    name: Build ksuinit
+    runs-on: ubuntu-latest
+    if: inputs.pack_ksuinit == true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup rustup
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+          rustup target add x86_64-linux-android
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          cache-targets: false
+
+      - name: Build ksuinit ARM64
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          BUILTINS="$($CLANG_PATH --print-resource-dir)/lib/linux/libclang_rt.builtins-aarch64-android.a"
+          test -f "$BUILTINS"
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$BUILTINS"
+          cargo build --package ksuinit --target=aarch64-linux-android --release
+
+      - name: Upload ksuinit ARM64
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksuinit-aarch64
+          path: target/aarch64-linux-android/release/ksuinit
+
+      - name: Build ksuinit x86_64
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          source .github/scripts/setup-rust-build.sh x86_64-linux-android 26
+          BUILTINS="$($CLANG_PATH --print-resource-dir)/lib/linux/libclang_rt.builtins-x86_64-android.a"
+          test -f "$BUILTINS"
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$BUILTINS"
+          cargo build --package ksuinit --target=x86_64-linux-android --release
+
+      - name: Upload ksuinit x86_64
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksuinit-x86_64
+          path: target/x86_64-linux-android/release/ksuinit
+
   # ============ Job 1: 构建所有 LKM（调用现有工作流） ============
   build-lkm:
     name: Build LKM for ${{ matrix.kmi }}
+    needs: build-ksuinit
+    if: always() && (needs.build-ksuinit.result == 'success' || needs.build-ksuinit.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -47,7 +108,8 @@ jobs:
   collect-lkm:
     name: Collect all LKM artifacts
     runs-on: ubuntu-latest
-    needs: build-lkm
+    needs: [build-lkm, build-ksuinit]
+    if: always() && (needs.build-lkm.result == 'success' || needs.build-lkm.result == 'skipped')
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -58,6 +120,14 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: ./lkm-artifacts
+
+      - name: Download ksuinit artifacts (if enabled)
+        if: inputs.pack_ksuinit == true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ksuinit-*
+          path: ./ksuinit-artifacts
+          merge-multiple: true
 
       - name: Organize LKM files by architecture
         run: |
@@ -76,6 +146,34 @@ jobs:
           ls -la ./userspace/ksud/bin/aarch64/ || echo "No ARM64 LKM files"
           echo "=== x86_64 LKM files ==="
           ls -la ./userspace/ksud/bin/x86_64/ || echo "No x86_64 LKM files"
+
+      - name: Copy ksuinit to ksud bin
+        if: inputs.pack_ksuinit == true
+        run: |
+          if [ -f "./ksuinit-artifacts/ksuinit" ]; then
+            # 判断是 ARM64 还是 x86_64
+            file ./ksuinit-artifacts/ksuinit | grep -q "ARM" && \
+              cp ./ksuinit-artifacts/ksuinit ./userspace/ksud/bin/aarch64/ || \
+              cp ./ksuinit-artifacts/ksuinit ./userspace/ksud/bin/x86_64/
+            echo "ksuinit copied to appropriate arch directory"
+          fi
+          
+          # 如果有多个架构的 ksuinit
+          if [ -d "./ksuinit-artifacts" ]; then
+            find ./ksuinit-artifacts -name "ksuinit" -type f | while read -r ksuinit; do
+              if file "$ksuinit" | grep -q "ARM"; then
+                cp "$ksuinit" ./userspace/ksud/bin/aarch64/
+                echo "Copied ARM64 ksuinit"
+              else
+                cp "$ksuinit" ./userspace/ksud/bin/x86_64/
+                echo "Copied x86_64 ksuinit"
+              fi
+            done
+          fi
+          
+          echo "=== ksuinit files ==="
+          ls -la ./userspace/ksud/bin/aarch64/ | grep ksuinit || echo "No ARM64 ksuinit"
+          ls -la ./userspace/ksud/bin/x86_64/ | grep ksuinit || echo "No x86_64 ksuinit"
 
       - name: Upload organized LKM
         uses: actions/upload-artifact@v7
@@ -106,19 +204,6 @@ jobs:
           ls -la ./userspace/ksud/bin/
           ls -la ./userspace/ksud/bin/aarch64/ || echo "No aarch64 directory"
           ls -la ./userspace/ksud/bin/x86_64/ || echo "No x86_64 directory"
-
-      - name: Prepare ksuinit (optional)
-        if: inputs.pack_ksuinit
-        run: |
-          mkdir -p ./userspace/ksud/bin/aarch64/
-          mkdir -p ./userspace/ksud/bin/x86_64/
-          # 如果 ksuinit 已经作为 artifact 存在
-          if [ -d "./ksuinit-aarch64" ]; then
-            cp ./ksuinit-aarch64/ksuinit ./userspace/ksud/bin/aarch64/
-          fi
-          if [ -d "./ksuinit-x86_64" ]; then
-            cp ./ksuinit-x86_64/ksuinit ./userspace/ksud/bin/x86_64/
-          fi
 
       - name: Setup rustup
         run: |
