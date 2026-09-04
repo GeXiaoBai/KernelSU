@@ -154,7 +154,7 @@ jobs:
           name: ksud-${{ inputs.target }}-with-lkm
           path: target/${{ inputs.target }}/release/ksud*
 
-  # ============ Job 3: 可选 - 打包所有内容上传到 Release ============
+    # ============ Job 3: 可选 - 打包所有内容上传到 Release ============
   package-release:
     name: Package and upload to Release
     runs-on: ubuntu-latest
@@ -170,4 +170,31 @@ jobs:
           path: ./ksud-bin
 
       - name: Package
-        ru
+        run: |
+          # 如果是 Android 目标，打包成 zip
+          if [[ "${{ inputs.target }}" == *"android"* ]]; then
+            zip -r ksud-${{ inputs.target }}.zip ./ksud-bin/
+          else
+            tar -czf ksud-${{ inputs.target }}.tar.gz ./ksud-bin/
+          fi
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          draft: true
+          prerelease: false
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./ksud-${{ inputs.target }}.zip
+          asset_name: ksud-${{ inputs.target }}-with-lkm.zip
+          asset_content_type: application/zip
