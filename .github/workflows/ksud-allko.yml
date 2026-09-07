@@ -284,82 +284,82 @@ jobs:
           path: target/${{ inputs.target }}/${{ inputs.debug_build == 'true' && 'debug' || 'release' }}/ksud*
 
 # ============ 任务 4: 打包并上传到 Release ============
-package-release:
-  name: 📦 打包并上传到 Release
-  runs-on: ${{ inputs.runner }}
-  needs: build-ksud
-  if: github.event_name == 'workflow_dispatch' && inputs.upload_to_release == true
-  permissions:
-    contents: write
-  steps:
-    - name: 📥 下载 ksud 构件
-      uses: actions/download-artifact@v8
-      with:
-        name: ksud-${{ inputs.target }}-with-lkm
-        path: ./ksud-bin
-
-    - name: 📦 打包二进制文件
-      id: package
-      run: |
-        cd ./ksud-bin
-        
-        echo "📦 正在为 ${{ inputs.target }} 打包..."
-        echo "📋 当前目录内容:"
-        ls -la
-        
-        # Windows 特殊处理：确保有 .exe 扩展名
-        if [[ "${{ inputs.target }}" == *"windows"* ]]; then
-          echo "🪟 处理 Windows 构建..."
-          if [ -f "./ksud" ]; then
-            if [ ! -f "./ksud.exe" ]; then
-              mv ./ksud ./ksud.exe
-              echo "✅ 已重命名 ksud -> ksud.exe"
-            else
-              rm -f ./ksud
-              echo "✅ 已删除重复的 ksud"
-            fi
-          fi
-          
-          if [ ! -f "./ksud.exe" ]; then
-            echo "❌ 错误：找不到 ksud.exe"
+  package-release:
+      name: 📦 打包并上传到 Release
+      runs-on: ${{ inputs.runner }}
+      needs: build-ksud
+      if: github.event_name == 'workflow_dispatch' && inputs.upload_to_release == true
+      permissions:
+        contents: write
+      steps:
+        - name: 📥 下载 ksud 构件
+          uses: actions/download-artifact@v8
+          with:
+            name: ksud-${{ inputs.target }}-with-lkm
+            path: ./ksud-bin
+    
+        - name: 📦 打包二进制文件
+          id: package
+          run: |
+            cd ./ksud-bin
+            
+            echo "📦 正在为 ${{ inputs.target }} 打包..."
             echo "📋 当前目录内容:"
             ls -la
-            exit 1
-          fi
-        fi
-        
-        # 统一打包为 ZIP（所有平台）
-        echo "📦 打包为 ZIP..."
-        zip -r ../ksud-${{ inputs.target }}.zip ./
-        
-        # 设置输出变量
-        echo "asset_path=../ksud-${{ inputs.target }}.zip" >> $GITHUB_OUTPUT
-        echo "asset_name=ksud-${{ inputs.target }}-with-lkm.zip" >> $GITHUB_OUTPUT
-        echo "content_type=application/zip" >> $GITHUB_OUTPUT
-        
-        echo "✅ 包创建完成: ksud-${{ inputs.target }}.zip"
-        echo "📦 文件大小:"
-        ls -lh ../ksud-${{ inputs.target }}.zip
-        cd ..
-      shell: bash
-
-    - name: 🏷️ 创建 Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref_name }}
-        release_name: Release ${{ github.ref_name }}
-        draft: true
-        prerelease: false
-
-    - name: 📤 上传 Release 附件
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ${{ steps.package.outputs.asset_path }}
-        asset_name: ${{ steps.package.outputs.asset_name }}
-        asset_content_type: ${{ steps.package.outputs.content_type }}
+            
+            # Windows 特殊处理：确保有 .exe 扩展名
+            if [[ "${{ inputs.target }}" == *"windows"* ]]; then
+              echo "🪟 处理 Windows 构建..."
+              if [ -f "./ksud" ]; then
+                if [ ! -f "./ksud.exe" ]; then
+                  mv ./ksud ./ksud.exe
+                  echo "✅ 已重命名 ksud -> ksud.exe"
+                else
+                  rm -f ./ksud
+                  echo "✅ 已删除重复的 ksud"
+                fi
+              fi
+              
+              if [ ! -f "./ksud.exe" ]; then
+                echo "❌ 错误：找不到 ksud.exe"
+                echo "📋 当前目录内容:"
+                ls -la
+                exit 1
+              fi
+            fi
+            
+            # 统一打包为 ZIP（所有平台）
+            echo "📦 打包为 ZIP..."
+            zip -r ../ksud-${{ inputs.target }}.zip ./
+            
+            # 设置输出变量
+            echo "asset_path=../ksud-${{ inputs.target }}.zip" >> $GITHUB_OUTPUT
+            echo "asset_name=ksud-${{ inputs.target }}-with-lkm.zip" >> $GITHUB_OUTPUT
+            echo "content_type=application/zip" >> $GITHUB_OUTPUT
+            
+            echo "✅ 包创建完成: ksud-${{ inputs.target }}.zip"
+            echo "📦 文件大小:"
+            ls -lh ../ksud-${{ inputs.target }}.zip
+            cd ..
+          shell: bash
+    
+        - name: 🏷️ 创建 Release
+          id: create_release
+          uses: actions/create-release@v1
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          with:
+            tag_name: ${{ github.ref_name }}
+            release_name: Release ${{ github.ref_name }}
+            draft: true
+            prerelease: false
+    
+        - name: 📤 上传 Release 附件
+          uses: actions/upload-release-asset@v1
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          with:
+            upload_url: ${{ steps.create_release.outputs.upload_url }}
+            asset_path: ${{ steps.package.outputs.asset_path }}
+            asset_name: ${{ steps.package.outputs.asset_name }}
+            asset_content_type: ${{ steps.package.outputs.content_type }}
