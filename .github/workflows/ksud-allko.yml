@@ -1,4 +1,4 @@
-name: 🚀 构建包含所有 LKM 的 ksud
+name: 构建包含所有 LKM 的 ksud
 
 on:
   workflow_dispatch:
