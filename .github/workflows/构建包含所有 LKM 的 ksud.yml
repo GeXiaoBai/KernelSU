@@ -8,29 +8,21 @@ on:
         required: true
         type: choice
         options:
-          - aarch64-linux-android
-          - x86_64-linux-android
-          - x86_64-unknown-linux-gnu
-          - x86_64-pc-windows-msvc
-          - aarch64-apple-darwin
-          - x86_64-apple-darwin
-        default: aarch64-linux-android
-
-      runner:
-        description: '💻 GitHub 运行环境（需与 target 匹配）'
-        required: true
-        type: choice
-        options:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
-        default: ubuntu-latest
+          - aarch64-linux-android        # Android ARM64（cross，ubuntu）
+          - x86_64-linux-android         # Android x86_64（cross，ubuntu）
+          - x86_64-unknown-linux-gnu     # Linux x86_64（cargo，ubuntu）
+          - aarch64-unknown-linux-musl   # Linux ARM64 musl（cross，ubuntu）
+          - x86_64-unknown-linux-musl    # Linux x86_64 musl（cross，ubuntu）
+          - x86_64-pc-windows-msvc       # Windows x64（cargo，windows）← 修 img 用
+          - aarch64-apple-darwin         # macOS M 芯片（cargo，macos）
+          - x86_64-apple-darwin          # macOS Intel（cargo，macos）
+        default: x86_64-pc-windows-msvc
 
       pack_ksuinit:
-        description: '📦 打包 ksuinit（仅 Android）'
+        description: '📦 打包 ksuinit（修补 Android img 必需，Windows/macOS 也要勾）'
         required: false
         type: boolean
-        default: false
+        default: true
 
       debug_build:
         description: '🐛 启用调试构建（代替发布构建）'
@@ -45,66 +37,61 @@ on:
         default: true
 
 jobs:
-  # ============ 任务 -1: 校验 runner / target 组合 ============
-  validate:
-    name: ✅ 校验 runner 与 target
+  # ============ 任务 -1: 根据 target 自动决定 runner 与构建模式 ============
+  prepare:
+    name: 🧭 推断 runner 与构建模式
     runs-on: ubuntu-latest
     outputs:
-      build_mode: ${{ steps.check.outputs.build_mode }}
-      valid: ${{ steps.check.outputs.valid }}
+      runner: ${{ steps.detect.outputs.runner }}
+      build_mode: ${{ steps.detect.outputs.build_mode }}
+      is_android: ${{ steps.detect.outputs.is_android }}
     steps:
-      - id: check
+      - id: detect
         run: |
           TARGET="${{ inputs.target }}"
-          RUNNER="${{ inputs.runner }}"
-          VALID=true
+          RUNNER=""
           MODE="cargo"
+          IS_ANDROID=false
 
           case "$TARGET" in
             *-linux-android)
-              if [ "$RUNNER" != "ubuntu-latest" ]; then
-                echo "::error::target=$TARGET 需要 runner=ubuntu-latest（使用 cross 构建）"
-                VALID=false
-              fi
+              RUNNER="ubuntu-latest"
+              MODE="cross"
+              IS_ANDROID=true
+              ;;
+            *-unknown-linux-musl)
+              RUNNER="ubuntu-latest"
               MODE="cross"
               ;;
+            *-unknown-linux-gnu)
+              RUNNER="ubuntu-latest"
+              MODE="cargo"
+              ;;
             *-apple-darwin)
-              if [ "$RUNNER" != "macos-latest" ]; then
-                echo "::error::target=$TARGET 需要 runner=macos-latest（不能使用 cross）"
-                VALID=false
-              fi
+              RUNNER="macos-latest"
               MODE="cargo"
               ;;
             *-pc-windows-*)
-              if [ "$RUNNER" != "windows-latest" ]; then
-                echo "::error::target=$TARGET 需要 runner=windows-latest"
-                VALID=false
-              fi
-              MODE="cargo"
-              ;;
-            *-unknown-linux-*)
-              if [ "$RUNNER" != "ubuntu-latest" ]; then
-                echo "::error::target=$TARGET 需要 runner=ubuntu-latest"
-                VALID=false
-              fi
+              RUNNER="windows-latest"
               MODE="cargo"
               ;;
             *)
               echo "::error::未识别的 target: $TARGET"
-              VALID=false
+              exit 1
               ;;
           esac
 
-          echo "valid=$VALID" >> $GITHUB_OUTPUT
+          echo "runner=$RUNNER" >> $GITHUB_OUTPUT
           echo "build_mode=$MODE" >> $GITHUB_OUTPUT
-          echo "target=$TARGET runner=$RUNNER mode=$MODE valid=$VALID"
+          echo "is_android=$IS_ANDROID" >> $GITHUB_OUTPUT
+          echo "target=$TARGET runner=$RUNNER mode=$MODE is_android=$IS_ANDROID"
 
-  # ============ 任务 0: 构建 ksuinit ============
+  # ============ 任务 0: 构建 ksuinit（无论 target 是什么，只要 pack_ksuinit=true 就跑）============
   build-ksuinit:
     name: 🔨 构建 ksuinit
     runs-on: ubuntu-latest
-    needs: validate
-    if: needs.validate.outputs.valid == 'true' && inputs.pack_ksuinit == true
+    needs: prepare
+    if: inputs.pack_ksuinit == true
     steps:
       - name: 📥 检出代码
         uses: actions/checkout@v7
@@ -162,8 +149,8 @@ jobs:
   # ============ 任务 1: 构建所有 LKM ============
   build-lkm:
     name: 🔨 为 ${{ matrix.kmi }} 构建 LKM
-    needs: [validate, build-ksuinit]
-    if: always() && needs.validate.outputs.valid == 'true' && (needs.build-ksuinit.result == 'success' || needs.build-ksuinit.result == 'skipped')
+    needs: [prepare, build-ksuinit]
+    if: always() && (needs.build-ksuinit.result == 'success' || needs.build-ksuinit.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -242,6 +229,21 @@ jobs:
           ls -la ./userspace/ksud/bin/aarch64/ | grep ksuinit || echo "⚠️ 没有 ARM64 ksuinit"
           ls -la ./userspace/ksud/bin/x86_64/ | grep ksuinit || echo "⚠️ 没有 x86_64 ksuinit"
 
+      - name: 🛡️ 校验修补 img 所需资源是否就绪
+        if: inputs.pack_ksuinit == true
+        run: |
+          MISSING=0
+          for arch in aarch64 x86_64; do
+            if [ ! -f "./userspace/ksud/bin/$arch/ksuinit" ]; then
+              echo "::error::缺少 userspace/ksud/bin/$arch/ksuinit，修补 Android img 会失败"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" = "1" ]; then
+            exit 1
+          fi
+          echo "✅ ksuinit 资源已就绪"
+
       - name: 📤 上传组织好的 LKM
         uses: actions/upload-artifact@v7
         with:
@@ -250,10 +252,10 @@ jobs:
 
   # ============ 任务 3: 构建 ksud ============
   build-ksud:
-    name: 🏗️ 在 ${{ inputs.runner }} 上构建 ksud
-    runs-on: ${{ inputs.runner }}
-    needs: [validate, collect-lkm]
-    if: needs.validate.outputs.valid == 'true' && needs.collect-lkm.result == 'success'
+    name: 🏗️ 在 ${{ needs.prepare.outputs.runner }} 上构建 ksud
+    runs-on: ${{ needs.prepare.outputs.runner }}
+    needs: [prepare, collect-lkm]
+    if: needs.collect-lkm.result == 'success'
     steps:
       - name: 📥 检出代码
         uses: actions/checkout@v7
@@ -288,13 +290,13 @@ jobs:
           cache-targets: false
           cache-bin: false
 
-      # ===== Android / musl：使用 cross（仅 ubuntu） =====
+      # ===== 模式 A: cross（Android / musl，仅 ubuntu） =====
       - name: 🐧 安装 cross
-        if: needs.validate.outputs.build_mode == 'cross'
+        if: needs.prepare.outputs.build_mode == 'cross'
         run: cargo install cross
 
       - name: 🐧 汇编 LKM 引导程序
-        if: needs.validate.outputs.build_mode == 'cross'
+        if: needs.prepare.outputs.build_mode == 'cross'
         run: |
           if [ -f "./userspace/ksud/src/lkm_image_bootstrap.S" ]; then
             clang --target=aarch64-linux-gnu -c -nostdlib \
@@ -303,7 +305,7 @@ jobs:
           fi
 
       - name: 🐧 构建 ksud（cross）
-        if: needs.validate.outputs.build_mode == 'cross'
+        if: needs.prepare.outputs.build_mode == 'cross'
         run: |
           echo "🏗️ 使用 cross 为 ${{ inputs.target }} 构建..."
           cd ./userspace/ksud
@@ -315,37 +317,9 @@ jobs:
           cd ../..
         shell: bash
 
-      # ===== Windows 原生：仅 windows target =====
-      - name: 🪟 构建 ksud（Windows）
-        if: runner.os == 'Windows'
-        run: |
-          echo "🏗️ 使用 cargo 为 ${{ inputs.target }} 构建..."
-          cd ./userspace/ksud
-          if [ "${{ inputs.debug_build }}" == "true" ]; then
-            cargo build --target ${{ inputs.target }}
-          else
-            cargo build --target ${{ inputs.target }} --release
-          fi
-          cd ../..
-        shell: bash
-
-      # ===== macOS 原生：仅 Apple target =====
-      - name: 🍎 构建 ksud（macOS）
-        if: runner.os == 'macOS'
-        run: |
-          echo "🏗️ 使用 cargo 为 ${{ inputs.target }} 构建..."
-          cd ./userspace/ksud
-          if [ "${{ inputs.debug_build }}" == "true" ]; then
-            cargo build --target ${{ inputs.target }}
-          else
-            cargo build --target ${{ inputs.target }} --release
-          fi
-          cd ../..
-        shell: bash
-
-      # ===== Linux gnu：直接用 cargo =====
-      - name: 🐧 构建 ksud（Linux gnu）
-        if: runner.os == 'Linux' && needs.validate.outputs.build_mode == 'cargo'
+      # ===== 模式 B: 原生 cargo（Windows / macOS / linux-gnu） =====
+      - name: 🪟🍎🐧 构建 ksud（cargo 原生）
+        if: needs.prepare.outputs.build_mode == 'cargo'
         run: |
           echo "🏗️ 使用 cargo 为 ${{ inputs.target }} 构建..."
           cd ./userspace/ksud
@@ -367,8 +341,8 @@ jobs:
   # ============ 任务 4: 打包并上传到 Release ============
   package-release:
     name: 📦 打包并上传到 Release
-    runs-on: ${{ inputs.runner }}
-    needs: build-ksud
+    runs-on: ${{ needs.prepare.outputs.runner }}
+    needs: [prepare, build-ksud]
     if: github.event_name == 'workflow_dispatch' && inputs.upload_to_release == true && needs.build-ksud.result == 'success'
     permissions:
       contents: write
@@ -388,18 +362,16 @@ jobs:
           echo "📋 当前目录内容:"
           ls -la
 
+          # Windows：确保有 .exe 后缀
           if [[ "${{ inputs.target }}" == *"windows"* ]]; then
             echo "🪟 处理 Windows 构建..."
-            if [ -f "./ksud" ]; then
-              if [ ! -f "./ksud.exe" ]; then
-                mv ./ksud ./ksud.exe
-                echo "✅ 已重命名 ksud -> ksud.exe"
-              else
-                rm -f ./ksud
-                echo "✅ 已删除重复的 ksud"
-              fi
+            if [ -f "./ksud" ] && [ ! -f "./ksud.exe" ]; then
+              mv ./ksud ./ksud.exe
+              echo "✅ 已重命名 ksud -> ksud.exe"
+            elif [ -f "./ksud" ] && [ -f "./ksud.exe" ]; then
+              rm -f ./ksud
+              echo "✅ 已删除重复的 ksud"
             fi
-
             if [ ! -f "./ksud.exe" ]; then
               echo "❌ 错误：找不到 ksud.exe"
               ls -la
