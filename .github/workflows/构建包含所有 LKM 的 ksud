@@ -1,0 +1,358 @@
+name: 构建包含所有 LKM 的 ksud
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '🎯 Rust 目标平台'
+        required: true
+        type: choice
+        options:
+          - aarch64-linux-android
+          - x86_64-linux-android
+          - x86_64-unknown-linux-gnu
+          - x86_64-pc-windows-msvc
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+        default: aarch64-linux-android
+      
+      runner:
+        description: '💻 GitHub 运行环境（Windows 构建推荐使用 windows-latest）'
+        required: true
+        type: choice
+        options:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+        default: ubuntu-latest
+      
+      pack_ksuinit:
+        description: '📦 打包 ksuinit（仅 Android）'
+        required: false
+        type: boolean
+        default: false
+      
+      debug_build:
+        description: '🐛 启用调试构建（代替发布构建）'
+        required: false
+        type: boolean
+        default: false
+      
+      upload_to_release:
+        description: '📤 上传到 GitHub Release'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  # ============ 任务 0: 构建 ksuinit ============
+  build-ksuinit:
+    name: 🔨 构建 ksuinit
+    runs-on: ubuntu-latest
+    if: inputs.pack_ksuinit == true
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 🔧 设置 Rust
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+          rustup target add x86_64-linux-android
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          cache-targets: false
+
+      - name: 🏗️ 构建 ksuinit ARM64
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          BUILTINS="$($CLANG_PATH --print-resource-dir)/lib/linux/libclang_rt.builtins-aarch64-android.a"
+          test -f "$BUILTINS"
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$BUILTINS"
+          cargo build --package ksuinit --target=aarch64-linux-android --release
+      - name: 📤 上传 ksuinit ARM64
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksuinit-aarch64
+          path: target/aarch64-linux-android/release/ksuinit
+
+      - name: 🏗️ 构建 ksuinit x86_64
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          source .github/scripts/setup-rust-build.sh x86_64-linux-android 26
+          BUILTINS="$($CLANG_PATH --print-resource-dir)/lib/linux/libclang_rt.builtins-x86_64-android.a"
+          test -f "$BUILTINS"
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$BUILTINS"
+          cargo build --package ksuinit --target=x86_64-linux-android --release
+      - name: 📤 上传 ksuinit x86_64
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksuinit-x86_64
+          path: target/x86_64-linux-android/release/ksuinit
+
+  # ============ 任务 1: 构建所有 LKM ============
+  build-lkm:
+    name: 🔨 为 ${{ matrix.kmi }} 构建 LKM
+    needs: build-ksuinit
+    if: always() && (needs.build-ksuinit.result == 'success' || needs.build-ksuinit.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+    uses: ./.github/workflows/ddk-lkm.yml
+    with:
+      kmi: ${{ matrix.kmi }}
+      expected_size2: ''
+      expected_hash2: ''
+
+  # ============ 任务 2: 收集所有 LKM ============
+  collect-lkm:
+    name: 📦 收集所有 LKM 构件
+    runs-on: ubuntu-latest
+    needs: [build-lkm, build-ksuinit]
+    if: always() && (needs.build-lkm.result == 'success' || needs.build-lkm.result == 'skipped')
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 📥 下载所有 LKM 构件
+        uses: actions/download-artifact@v8
+        with:
+          path: ./lkm-artifacts
+
+      - name: 📥 下载 ksuinit 构件（如果启用）
+        if: inputs.pack_ksuinit == true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ksuinit-*
+          path: ./ksuinit-artifacts
+          merge-multiple: true
+
+      - name: 📂 按架构组织 LKM 文件
+        run: |
+          echo "📂 正在处理 LKM 构件..."
+          ls -R ./lkm-artifacts || echo "⚠️ 没有 LKM 构件"
+          
+          echo "📁 创建目录..."
+          mkdir -p ./userspace/ksud/bin/aarch64/
+          mkdir -p ./userspace/ksud/bin/x86_64/
+          
+          echo "📋 复制 .ko 文件..."
+          find ./lkm-artifacts -name "*.ko" -type f -exec cp {} ./userspace/ksud/bin/aarch64/ \; 2>/dev/null || true
+          find ./lkm-artifacts -name "*.ko" -type f -exec cp {} ./userspace/ksud/bin/x86_64/ \; 2>/dev/null || true
+          
+          echo "✅ ARM64 LKM 文件:"
+          ls -la ./userspace/ksud/bin/aarch64/ || echo "⚠️ 没有 ARM64 LKM 文件"
+          echo "✅ x86_64 LKM 文件:"
+          ls -la ./userspace/ksud/bin/x86_64/ || echo "⚠️ 没有 x86_64 LKM 文件"
+      - name: 📋 复制 ksuinit 到 ksud 目录
+        if: inputs.pack_ksuinit == true
+        run: |
+          if [ -d "./ksuinit-artifacts" ]; then
+            find ./ksuinit-artifacts -name "ksuinit" -type f | while read -r ksuinit; do
+              if file "$ksuinit" | grep -q "ARM"; then
+                cp "$ksuinit" ./userspace/ksud/bin/aarch64/
+                echo "✅ 已复制 ARM64 ksuinit"
+              else
+                cp "$ksuinit" ./userspace/ksud/bin/x86_64/
+                echo "✅ 已复制 x86_64 ksuinit"
+              fi
+            done
+          fi
+          
+          echo "📋 ksuinit 文件:"
+          ls -la ./userspace/ksud/bin/aarch64/ | grep ksuinit || echo "⚠️ 没有 ARM64 ksuinit"
+          ls -la ./userspace/ksud/bin/x86_64/ | grep ksuinit || echo "⚠️ 没有 x86_64 ksuinit"
+      - name: 📤 上传组织好的 LKM
+        uses: actions/upload-artifact@v7
+        with:
+          name: organized-lkm
+          path: ./userspace/ksud/bin/
+
+  # ============ 任务 3: 构建 ksud ============
+  build-ksud:
+    name: 🏗️ 在 ${{ inputs.runner }} 上构建 ksud
+    runs-on: ${{ inputs.runner }}
+    needs: collect-lkm
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 📥 下载组织好的 LKM
+        uses: actions/download-artifact@v8
+        with:
+          name: organized-lkm
+          path: ./userspace/ksud/bin/
+
+      - name: 📋 验证 LKM 文件是否就位
+        run: |
+          echo "📂 ksud/bin 中的 LKM 文件:"
+          ls -la ./userspace/ksud/bin/ || echo "⚠️ 目录不存在"
+          ls -la ./userspace/ksud/bin/aarch64/ || echo "⚠️ 没有 aarch64 目录"
+          ls -la ./userspace/ksud/bin/x86_64/ || echo "⚠️ 没有 x86_64 目录"
+        shell: bash
+
+      - name: 🔧 设置 Rust
+        run: |
+          rustup update stable
+          rustup target add ${{ inputs.target }}
+          rustc --version
+          cargo --version
+        shell: bash
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: userspace/ksud
+          cache-targets: false
+          cache-bin: false
+
+      # ===== Windows 原生构建 =====
+      - name: 🪟 构建 ksud（Windows）
+        if: runner.os == 'Windows'
+        run: |
+          echo "🏗️ 正在为 Windows 构建..."
+          cd ./userspace/ksud
+          if [ "${{ inputs.debug_build }}" == "true" ]; then
+            cargo build --target ${{ inputs.target }}
+          else
+            cargo build --target ${{ inputs.target }} --release
+          fi
+          cd ../..
+        shell: bash
+
+      # ===== Unix 构建（使用 cross） =====
+      - name: 🐧 安装 cross（Unix）
+        if: runner.os != 'Windows'
+        run: |
+          cargo install cross
+      - name: 🐧 汇编 LKM 引导程序（Unix）
+        if: runner.os != 'Windows'
+        run: |
+          if [ -f "./userspace/ksud/src/lkm_image_bootstrap.S" ]; then
+            clang --target=aarch64-linux-gnu -c -nostdlib \
+              -o userspace/ksud/.lkm_image_bootstrap.o \
+              userspace/ksud/src/lkm_image_bootstrap.S || true
+          fi
+      - name: 🐧 构建 ksud（Unix）
+        if: runner.os != 'Windows'
+        run: |
+          echo "🏗️ 正在为 ${{ inputs.target }} 构建..."
+          cd ./userspace/ksud
+          if [ "${{ inputs.debug_build }}" == "true" ]; then
+            cross build --target ${{ inputs.target }}
+          else
+            cross build --target ${{ inputs.target }} --release
+          fi
+          cd ../..
+        shell: bash
+
+      # ===== 上传产物 =====
+      - name: 📤 上传包含 LKM 的 ksud
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksud-${{ inputs.target }}-with-lkm
+          path: target/${{ inputs.target }}/${{ inputs.debug_build == 'true' && 'debug' || 'release' }}/ksud*
+
+# ============ 任务 4: 打包并上传到 Release ============
+  package-release:
+      name: 📦 打包并上传到 Release
+      runs-on: ${{ inputs.runner }}
+      needs: build-ksud
+      if: github.event_name == 'workflow_dispatch' && inputs.upload_to_release == true
+      permissions:
+        contents: write
+      steps:
+        - name: 📥 下载 ksud 构件
+          uses: actions/download-artifact@v8
+          with:
+            name: ksud-${{ inputs.target }}-with-lkm
+            path: ./ksud-bin
+    
+        - name: 📦 打包二进制文件
+          id: package
+          run: |
+            cd ./ksud-bin
+            
+            echo "📦 正在为 ${{ inputs.target }} 打包..."
+            echo "📋 当前目录内容:"
+            ls -la
+            
+            # Windows 特殊处理：确保有 .exe 扩展名
+            if [[ "${{ inputs.target }}" == *"windows"* ]]; then
+              echo "🪟 处理 Windows 构建..."
+              if [ -f "./ksud" ]; then
+                if [ ! -f "./ksud.exe" ]; then
+                  mv ./ksud ./ksud.exe
+                  echo "✅ 已重命名 ksud -> ksud.exe"
+                else
+                  rm -f ./ksud
+                  echo "✅ 已删除重复的 ksud"
+                fi
+              fi
+              
+              if [ ! -f "./ksud.exe" ]; then
+                echo "❌ 错误：找不到 ksud.exe"
+                echo "📋 当前目录内容:"
+                ls -la
+                exit 1
+              fi
+            fi
+            
+            # 统一打包为 ZIP（所有平台）
+            echo "📦 打包为 ZIP..."
+            zip -r ../ksud-${{ inputs.target }}.zip ./
+            
+            # 设置输出变量
+            echo "asset_path=../ksud-${{ inputs.target }}.zip" >> $GITHUB_OUTPUT
+            echo "asset_name=ksud-${{ inputs.target }}-with-lkm.zip" >> $GITHUB_OUTPUT
+            echo "content_type=application/zip" >> $GITHUB_OUTPUT
+            
+            echo "✅ 包创建完成: ksud-${{ inputs.target }}.zip"
+            echo "📦 文件大小:"
+            ls -lh ../ksud-${{ inputs.target }}.zip
+            cd ..
+          shell: bash
+    
+        - name: 🏷️ 创建 Release
+          id: create_release
+          uses: actions/create-release@v1
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          with:
+            tag_name: ${{ github.ref_name }}
+            release_name: Release ${{ github.ref_name }}
+            draft: true
+            prerelease: false
+    
+        - name: 📤 上传 Release 附件
+          uses: actions/upload-release-asset@v1
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          with:
+            upload_url: ${{ steps.create_release.outputs.upload_url }}
+            asset_path: ${{ steps.package.outputs.asset_path }}
+            asset_name: ${{ steps.package.outputs.asset_name }}
+            asset_content_type: ${{ steps.package.outputs.content_type }}
