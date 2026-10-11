@@ -100,6 +100,7 @@ jobs:
 
   build-lkm:
     needs: generate-key
+    if: always() && (needs.generate-key.result == 'success' || needs.generate-key.result == 'skipped')
     uses: ./.github/workflows/build-lkm.yml
     with:
       expected_size: ${{ needs.generate-key.outputs.expected_size || '' }}
@@ -111,6 +112,7 @@ jobs:
 
   build-ksud:
     needs: [build-lkm, build-ksuinit]
+    if: always() && (needs.build-lkm.result == 'success' || needs.build-lkm.result == 'skipped')
     strategy:
       matrix:
         include:
@@ -125,6 +127,7 @@ jobs:
 
   build-ksud-extra:
     needs: [build-lkm, build-ksuinit]
+    if: always() && (needs.build-lkm.result == 'success' || needs.build-lkm.result == 'skipped')
     strategy:
       matrix:
         include:
@@ -147,7 +150,7 @@ jobs:
 
   build-manager:
     needs: [generate-key]
-    if: always() && needs.generate-key.result == 'success'
+    if: always() && (needs.generate-key.result == 'success' || needs.generate-key.result == 'skipped')
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -161,7 +164,7 @@ jobs:
           fetch-depth: 0
 
       - name: Write key
-        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
+        if: ${{ github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') || github.ref_type == 'tag') }}
         run: |
           if [ ! -z "${{ secrets.KEYSTORE }}" ]; then
             {
@@ -223,7 +226,7 @@ jobs:
 
   repack-manager:
     needs: [build-manager, build-ksud, generate-key]
-    if: always() && needs.build-manager.result == 'success' && needs.build-ksud.result == 'success' && needs.generate-key.result == 'success'
+    if: always() && needs.build-manager.result == 'success' && needs.build-ksud.result == 'success' && (needs.generate-key.result == 'success' || needs.generate-key.result == 'skipped')
     runs-on: ubuntu-latest
 
     steps:
@@ -303,6 +306,23 @@ jobs:
             echo "SIGN_KEY_ALIAS=pr-key" >> $GITHUB_ENV
             echo "SIGN_KEYSTORE_PASSWORD=$PR_KEYSTORE_PASSWORD" >> $GITHUB_ENV
             echo "SIGN_KEY_PASSWORD=$PR_KEY_PASSWORD" >> $GITHUB_ENV
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # 内置生成密钥，用于正式版签名
+            KEYSTORE_PASSWORD=$(openssl rand -hex 32)
+            KEY_PASSWORD=$(openssl rand -hex 32)
+            keytool -genkeypair \
+              -alias key \
+              -keyalg RSA -keysize 2048 \
+              -validity 1 \
+              -storepass "$KEYSTORE_PASSWORD" \
+              -keypass "$KEY_PASSWORD" \
+              -dname "CN=KernelSU-GXB" \
+              -storetype JKS \
+              -keystore key.jks
+            echo "SIGN_KEYSTORE_FILE=key.jks" >> $GITHUB_ENV
+            echo "SIGN_KEY_ALIAS=key" >> $GITHUB_ENV
+            echo "SIGN_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> $GITHUB_ENV
+            echo "SIGN_KEY_PASSWORD=$KEY_PASSWORD" >> $GITHUB_ENV
           elif [ -n "$PROD_KEYSTORE" ]; then
             echo "$PROD_KEYSTORE" | base64 -d > key.jks
             echo "SIGN_KEYSTORE_FILE=key.jks" >> $GITHUB_ENV
